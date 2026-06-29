@@ -15,7 +15,7 @@
     <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js">
     </script>
     <style>
-        /* ===== CSS LENGKAP (sama seperti sebelumnya, ditambah style progress) ===== */
+        /* ===== CSS LENGKAP ===== */
         :root,
         [data-theme="dark"] {
             --bg-primary: #0b1120;
@@ -1022,6 +1022,15 @@
             transform: translateY(-1px);
             background: linear-gradient(135deg, #3b82f6, #2563eb);
         }
+        .btn-delete-all {
+            background: rgba(239, 68, 68, 0.12);
+            border-color: rgba(239, 68, 68, 0.3);
+            color: var(--danger);
+        }
+        .btn-delete-all:hover {
+            background: rgba(239, 68, 68, 0.25);
+            border-color: var(--danger);
+        }
 
         /* ===== TABLE ===== */
         .table-card {
@@ -1716,7 +1725,6 @@
         .master-modal .modal {
             max-width: 500px;
         }
-        /* Progress bar untuk upload */
         .upload-progress {
             display: none;
             margin-top: 8px;
@@ -1946,6 +1954,7 @@
                         <input type="file" accept=".xlsx,.xls" onchange="uploadMasterExcel(event)" />
                     </div>
                     <button class="btn btn-download btn-sm" onclick="downloadMasterExcel()" id="downloadMasterBtn"><i class="fas fa-file-excel"></i> Download Excel</button>
+                    <button class="btn btn-danger btn-sm" onclick="deleteAllMaster()" id="deleteAllBtn"><i class="fas fa-trash-alt"></i> Hapus Semua</button>
                     <!-- Progress indicator -->
                     <div class="upload-progress" id="uploadProgress">
                         <div class="progress-text">
@@ -2189,6 +2198,13 @@
             store = store || CACHE_STORE;
             openIDB().then(function(idb) {
                 idb.transaction(store, 'readwrite').objectStore(store).delete(id);
+            }).catch(function() {});
+        }
+
+        function clearCache(store) {
+            store = store || CACHE_STORE;
+            openIDB().then(function(idb) {
+                idb.transaction(store, 'readwrite').objectStore(store).clear();
             }).catch(function() {});
         }
 
@@ -2639,7 +2655,80 @@
             });
         }
 
-        // ===== UPLOAD MASTER EXCEL (OPTIMASI BATCH + PROGRESS) =====
+        // ===== DELETE ALL MASTER =====
+        function deleteAllMaster() {
+            if (!isAdmin) { showToast('Hanya Admin yang bisa menghapus semua data.', 'warning'); return; }
+            if (allMaster.length === 0) { showToast('Tidak ada data master untuk dihapus.', 'warning'); return; }
+
+            // Konfirmasi pertama
+            if (!confirm('⚠️ PERINGATAN!\n\nAnda akan menghapus SEMUA data master komponen (' + allMaster.length +
+                    ' item).\n\nTindakan ini TIDAK DAPAT DIURUNGKAN.\n\nYakin ingin melanjutkan?')) {
+                return;
+            }
+
+            // Konfirmasi kedua (verifikasi)
+            var verify = prompt('Ketik "HAPUS" untuk mengonfirmasi penghapusan semua data:');
+            if (verify !== 'HAPUS') {
+                showToast('Penghapusan dibatalkan.', 'info');
+                return;
+            }
+
+            var btn = document.getElementById('deleteAllBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<div class="spinner"></div>';
+
+            // Ambil semua ID dokumen
+            var docIds = allMaster.map(function(o) { return o._docId; });
+            var total = docIds.length;
+            var batchSize = 500;
+            var batches = Math.ceil(total / batchSize);
+            var processed = 0;
+            var errors = 0;
+
+            function processDeleteBatch(batchIndex) {
+                var start = batchIndex * batchSize;
+                var end = Math.min(start + batchSize, total);
+                var batch = db.batch();
+                for (var i = start; i < end; i++) {
+                    var ref = db.collection(MASTER_COL).doc(docIds[i]);
+                    batch.delete(ref);
+                }
+                return batch.commit().then(function() {
+                    processed += (end - start);
+                    if (processed < total) {
+                        return processDeleteBatch(batchIndex + 1);
+                    } else {
+                        return Promise.resolve();
+                    }
+                }).catch(function(er) {
+                    errors++;
+                    // Lanjut ke batch berikutnya
+                    if (processed < total) {
+                        return processDeleteBatch(batchIndex + 1);
+                    } else {
+                        return Promise.resolve();
+                    }
+                });
+            }
+
+            processDeleteBatch(0).then(function() {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-trash-alt"></i> Hapus Semua';
+                // Clear cache lokal
+                clearCache(MASTER_CACHE_STORE);
+                if (errors > 0) {
+                    showToast('Penghapusan selesai dengan ' + errors + ' error.', 'warning');
+                } else {
+                    showToast('✅ Semua data master berhasil dihapus! (' + total + ' item)', 'success');
+                }
+            }).catch(function(er) {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-trash-alt"></i> Hapus Semua';
+                showToast('Gagal menghapus: ' + er.message, 'error');
+            });
+        }
+
+        // ===== UPLOAD MASTER EXCEL =====
         function uploadMasterExcel(event) {
             if (!isAdmin) { showToast('Hanya Admin yang bisa upload.', 'warning'); return; }
             var file = event.target.files[0];
@@ -2679,7 +2768,6 @@
                         return;
                     }
 
-                    // Kumpulkan data valid
                     var items = [];
                     for (var r = 1; r < json.length; r++) {
                         var row = json[r];
@@ -2698,7 +2786,7 @@
 
                     label.textContent = 'Mengupload ' + items.length + ' item...';
                     var total = items.length;
-                    var batchSize = 500; // Maksimal 500 per batch (Firestore limit)
+                    var batchSize = 500;
                     var batches = Math.ceil(total / batchSize);
                     var processed = 0;
                     var errors = 0;
@@ -2721,7 +2809,6 @@
                             fill.style.width = pct + '%';
                             percent.textContent = pct + '%';
                             label.textContent = 'Proses ' + processed + '/' + total;
-                            // Lanjut ke batch berikutnya
                             if (processed < total) {
                                 return processBatch(batchIndex + 1);
                             } else {
@@ -2729,7 +2816,6 @@
                             }
                         }).catch(function(er) {
                             errors++;
-                            // Coba lanjutkan ke batch berikutnya meskipun ada error
                             if (processed < total) {
                                 return processBatch(batchIndex + 1);
                             } else {
@@ -2738,7 +2824,6 @@
                         });
                     }
 
-                    // Mulai proses batch pertama
                     processBatch(0).then(function() {
                         if (errors > 0) {
                             showToast('Upload selesai dengan ' + errors + ' error.', 'warning');
@@ -2757,10 +2842,10 @@
                 }
             };
             reader.readAsArrayBuffer(file);
-            event.target.value = ''; // reset input
+            event.target.value = '';
         }
 
-        // ===== DOWNLOAD MASTER EXCEL (OPTIMASI UNTUK DATA BESAR) =====
+        // ===== DOWNLOAD MASTER EXCEL =====
         function downloadMasterExcel() {
             if (allMaster.length === 0) { showToast('Tidak ada data master.', 'error'); return; }
 
@@ -2768,24 +2853,20 @@
             btn.disabled = true;
             btn.innerHTML = '<div class="spinner"></div>';
 
-            // Gunakan setTimeout agar UI tetap responsif
             setTimeout(function() {
                 try {
                     var rows = [
                         ['No', 'Part Number', 'Description']
                     ];
-                    // Gunakan loop cepat
                     var data = allMaster;
                     for (var i = 0; i < data.length; i++) {
                         rows.push([i + 1, data[i].partNumber || '', data[i].description || '']);
                     }
 
-                    // Buat workbook dengan opsi bookSST untuk file besar
                     var wb = XLSX.utils.book_new();
                     var ws = XLSX.utils.aoa_to_sheet(rows);
                     XLSX.utils.book_append_sheet(wb, ws, 'Master Komponen');
 
-                    // Tulis dengan tipe array untuk performa lebih baik
                     var wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array', bookSST: true });
                     var blob = new Blob([wbout], { type: 'application/octet-stream' });
                     var link = document.createElement('a');
@@ -2820,7 +2901,6 @@
                         namaPart.style.borderColor = '';
                         return;
                     }
-                    // Cari di master berdasarkan partNumber (case insensitive)
                     var found = allMaster.find(function(o) {
                         return (o.partNumber || '').toLowerCase() === val.toLowerCase();
                     });
@@ -3580,7 +3660,7 @@
         document.getElementById('editModal').addEventListener('click', function(e) { if (e.target === this) closeEditModal(); });
         document.getElementById('masterModal').addEventListener('click', function(e) { if (e.target === this) closeMasterModal(); });
 
-        console.log('✅ Aplikasi siap - User hanya bisa ubah status, Admin edit semua field. Master Komponen dengan optimasi kecepatan.');
+        console.log('✅ Aplikasi siap - User hanya bisa ubah status, Admin edit semua field. Master Komponen dengan tombol Hapus Semua.');
     </script>
 </body>
 </html>
