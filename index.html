@@ -15,7 +15,7 @@
     <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js">
     </script>
     <style>
-        /* ===== CSS LENGKAP (sama seperti sebelumnya, ditambah style untuk master) ===== */
+        /* ===== CSS LENGKAP (sama seperti sebelumnya, ditambah style progress) ===== */
         :root,
         [data-theme="dark"] {
             --bg-primary: #0b1120;
@@ -1716,6 +1716,37 @@
         .master-modal .modal {
             max-width: 500px;
         }
+        /* Progress bar untuk upload */
+        .upload-progress {
+            display: none;
+            margin-top: 8px;
+            padding: 8px 12px;
+            background: var(--bg-card);
+            border-radius: var(--radius);
+            border: 1px solid var(--border);
+        }
+        .upload-progress.active {
+            display: block;
+        }
+        .upload-progress .progress-bar {
+            height: 6px;
+            border-radius: 3px;
+            background: var(--border);
+            overflow: hidden;
+            margin-top: 4px;
+        }
+        .upload-progress .progress-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, var(--accent), #00a88a);
+            transition: width 0.3s ease;
+        }
+        .upload-progress .progress-text {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            display: flex;
+            justify-content: space-between;
+        }
     </style>
 </head>
 <body>
@@ -1911,10 +1942,18 @@
                 <div class="master-actions">
                     <button class="btn btn-primary btn-sm" onclick="openMasterModal()"><i class="fas fa-plus"></i> Tambah Manual</button>
                     <div class="file-input-wrapper">
-                        <button class="btn btn-upload btn-sm"><i class="fas fa-upload"></i> Upload Excel</button>
+                        <button class="btn btn-upload btn-sm" id="uploadMasterBtn"><i class="fas fa-upload"></i> Upload Excel</button>
                         <input type="file" accept=".xlsx,.xls" onchange="uploadMasterExcel(event)" />
                     </div>
-                    <button class="btn btn-download btn-sm" onclick="downloadMasterExcel()"><i class="fas fa-file-excel"></i> Download Excel</button>
+                    <button class="btn btn-download btn-sm" onclick="downloadMasterExcel()" id="downloadMasterBtn"><i class="fas fa-file-excel"></i> Download Excel</button>
+                    <!-- Progress indicator -->
+                    <div class="upload-progress" id="uploadProgress">
+                        <div class="progress-text">
+                            <span id="progressLabel">Mengupload...</span>
+                            <span id="progressPercent">0%</span>
+                        </div>
+                        <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+                    </div>
                 </div>
                 <div class="table-card">
                     <div class="table-toolbar">
@@ -2600,18 +2639,31 @@
             });
         }
 
+        // ===== UPLOAD MASTER EXCEL (OPTIMASI BATCH + PROGRESS) =====
         function uploadMasterExcel(event) {
             if (!isAdmin) { showToast('Hanya Admin yang bisa upload.', 'warning'); return; }
             var file = event.target.files[0];
             if (!file) return;
+
+            var progressEl = document.getElementById('uploadProgress');
+            var fill = document.getElementById('progressFill');
+            var percent = document.getElementById('progressPercent');
+            var label = document.getElementById('progressLabel');
+
+            progressEl.classList.add('active');
+            fill.style.width = '0%';
+            percent.textContent = '0%';
+            label.textContent = 'Membaca file...';
+
             var reader = new FileReader();
             reader.onload = function(e) {
                 try {
                     var data = new Uint8Array(e.target.result);
                     var workbook = XLSX.read(data, { type: 'array' });
                     var sheet = workbook.Sheets[workbook.SheetNames[0]];
-                    var json = XLSX.utils.sheet_to_json(sheet, { header: 1 });
-                    var header = json[0];
+                    var json = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+
+                    var header = json[0] || [];
                     var colPart = -1,
                         colDesc = -1;
                     for (var i = 0; i < header.length; i++) {
@@ -2623,54 +2675,137 @@
                     }
                     if (colPart === -1 || colDesc === -1) {
                         showToast('Format tidak sesuai. Pastikan kolom Part Number dan Description ada.', 'error');
+                        progressEl.classList.remove('active');
                         return;
                     }
-                    var batch = db.batch();
-                    var count = 0;
+
+                    // Kumpulkan data valid
+                    var items = [];
                     for (var r = 1; r < json.length; r++) {
                         var row = json[r];
                         var part = String(row[colPart] || '').trim();
                         var desc = String(row[colDesc] || '').trim();
                         if (part && desc) {
-                            var ref = db.collection(MASTER_COL).doc();
-                            batch.set(ref, {
-                                partNumber: part,
-                                description: desc,
-                                createdAt: firebase.firestore.FieldValue.serverTimestamp()
-                            });
-                            count++;
+                            items.push({ partNumber: part, description: desc });
                         }
                     }
-                    if (count === 0) { showToast('Tidak ada data valid yang ditemukan.', 'warning'); return; }
-                    batch.commit().then(function() {
-                        showToast('Upload berhasil! ' + count + ' item ditambahkan.', 'success');
+
+                    if (items.length === 0) {
+                        showToast('Tidak ada data valid ditemukan.', 'warning');
+                        progressEl.classList.remove('active');
+                        return;
+                    }
+
+                    label.textContent = 'Mengupload ' + items.length + ' item...';
+                    var total = items.length;
+                    var batchSize = 500; // Maksimal 500 per batch (Firestore limit)
+                    var batches = Math.ceil(total / batchSize);
+                    var processed = 0;
+                    var errors = 0;
+
+                    function processBatch(batchIndex) {
+                        var start = batchIndex * batchSize;
+                        var end = Math.min(start + batchSize, total);
+                        var batch = db.batch();
+                        for (var j = start; j < end; j++) {
+                            var ref = db.collection(MASTER_COL).doc();
+                            batch.set(ref, {
+                                partNumber: items[j].partNumber,
+                                description: items[j].description,
+                                createdAt: firebase.firestore.FieldValue.serverTimestamp()
+                            });
+                        }
+                        return batch.commit().then(function() {
+                            processed += (end - start);
+                            var pct = Math.round((processed / total) * 100);
+                            fill.style.width = pct + '%';
+                            percent.textContent = pct + '%';
+                            label.textContent = 'Proses ' + processed + '/' + total;
+                            // Lanjut ke batch berikutnya
+                            if (processed < total) {
+                                return processBatch(batchIndex + 1);
+                            } else {
+                                return Promise.resolve();
+                            }
+                        }).catch(function(er) {
+                            errors++;
+                            // Coba lanjutkan ke batch berikutnya meskipun ada error
+                            if (processed < total) {
+                                return processBatch(batchIndex + 1);
+                            } else {
+                                return Promise.resolve();
+                            }
+                        });
+                    }
+
+                    // Mulai proses batch pertama
+                    processBatch(0).then(function() {
+                        if (errors > 0) {
+                            showToast('Upload selesai dengan ' + errors + ' error.', 'warning');
+                        } else {
+                            showToast('Upload berhasil! ' + total + ' item ditambahkan.', 'success');
+                        }
+                        progressEl.classList.remove('active');
                     }).catch(function(er) {
-                        showToast('Error: ' + er.message, 'error');
+                        showToast('Gagal upload: ' + er.message, 'error');
+                        progressEl.classList.remove('active');
                     });
+
                 } catch (er) {
                     showToast('Gagal baca file: ' + er.message, 'error');
+                    progressEl.classList.remove('active');
                 }
             };
             reader.readAsArrayBuffer(file);
-            event.target.value = '';
+            event.target.value = ''; // reset input
         }
 
+        // ===== DOWNLOAD MASTER EXCEL (OPTIMASI UNTUK DATA BESAR) =====
         function downloadMasterExcel() {
             if (allMaster.length === 0) { showToast('Tidak ada data master.', 'error'); return; }
-            var rows = [
-                ['No', 'Part Number', 'Description']
-            ];
-            allMaster.forEach(function(o, i) {
-                rows.push([i + 1, o.partNumber || '', o.description || '']);
-            });
-            var wb = XLSX.utils.book_new(),
-                ws = XLSX.utils.aoa_to_sheet(rows);
-            XLSX.utils.book_append_sheet(wb, ws, 'Master Komponen');
-            var t = new Date(),
-                ds = t.getFullYear() + '' + String(t.getMonth() + 1).padStart(2, '0') + String(t.getDate()).padStart(2,
-                '0');
-            XLSX.writeFile(wb, 'Master_Komponen_' + ds + '.xlsx');
-            showToast('Download berhasil!', 'success');
+
+            var btn = document.getElementById('downloadMasterBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<div class="spinner"></div>';
+
+            // Gunakan setTimeout agar UI tetap responsif
+            setTimeout(function() {
+                try {
+                    var rows = [
+                        ['No', 'Part Number', 'Description']
+                    ];
+                    // Gunakan loop cepat
+                    var data = allMaster;
+                    for (var i = 0; i < data.length; i++) {
+                        rows.push([i + 1, data[i].partNumber || '', data[i].description || '']);
+                    }
+
+                    // Buat workbook dengan opsi bookSST untuk file besar
+                    var wb = XLSX.utils.book_new();
+                    var ws = XLSX.utils.aoa_to_sheet(rows);
+                    XLSX.utils.book_append_sheet(wb, ws, 'Master Komponen');
+
+                    // Tulis dengan tipe array untuk performa lebih baik
+                    var wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array', bookSST: true });
+                    var blob = new Blob([wbout], { type: 'application/octet-stream' });
+                    var link = document.createElement('a');
+                    link.href = URL.createObjectURL(blob);
+                    var t = new Date(),
+                        ds = t.getFullYear() + '' + String(t.getMonth() + 1).padStart(2, '0') + String(t.getDate())
+                        .padStart(2, '0');
+                    link.download = 'Master_Komponen_' + ds + '.xlsx';
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                    setTimeout(function() { URL.revokeObjectURL(link.href); }, 100);
+
+                    showToast('Download berhasil! (' + data.length + ' item)', 'success');
+                } catch (er) {
+                    showToast('Gagal download: ' + er.message, 'error');
+                }
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-file-excel"></i> Download Excel';
+            }, 50);
         }
 
         // ===== INTEGRASI NO GUDANG -> NAMA PART =====
@@ -2682,6 +2817,7 @@
                     var val = this.value.trim();
                     if (!val) {
                         namaPart.value = '';
+                        namaPart.style.borderColor = '';
                         return;
                     }
                     // Cari di master berdasarkan partNumber (case insensitive)
@@ -3444,7 +3580,7 @@
         document.getElementById('editModal').addEventListener('click', function(e) { if (e.target === this) closeEditModal(); });
         document.getElementById('masterModal').addEventListener('click', function(e) { if (e.target === this) closeMasterModal(); });
 
-        console.log('✅ Aplikasi siap - User hanya bisa ubah status, Admin edit semua field. Master Komponen aktif.');
+        console.log('✅ Aplikasi siap - User hanya bisa ubah status, Admin edit semua field. Master Komponen dengan optimasi kecepatan.');
     </script>
 </body>
 </html>
